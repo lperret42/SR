@@ -93,13 +93,17 @@ def sample_jp2_images_by_size(input_dir, n_images, min_size_bytes, seed):
     return candidates[:n_images]
 
 
-def process_single_image(img_path_str, output_root_str, downsample, tile_size, n_tiles, blur_kernel, noise_std):
-    """Worker function executed in a separate process. Returns a dict with results."""
+def process_single_image(img_path_str, output_root_str, downsample_factors, tile_size, n_tiles, blur_kernel, noise_std):
+    """Worker function executed in a separate process. Returns a dict with results.
+    downsample_factors: list[int]"""
     start = time.time()
     output_root = Path(output_root_str)
     img_path = Path(img_path_str)
     sr_dir = output_root / "sr"
-    lr_dir = output_root / f"lr_x{downsample}"
+
+    # Ensure LR directories exist (avoid race with parents=True)
+    for f in downsample_factors:
+        (output_root / f"lr_x{f}").mkdir(exist_ok=True, parents=True)
 
     img = load_jp2_image(img_path)
     if img is None:
@@ -107,6 +111,7 @@ def process_single_image(img_path_str, output_root_str, downsample, tile_size, n
             "status": "corrupted",
             "filename": img_path.name,
             "tiles": 0,
+            "lr_tiles": 0,
             "mapping": [],
             "per_image": None,
             "duration": time.time() - start,
@@ -115,9 +120,10 @@ def process_single_image(img_path_str, output_root_str, downsample, tile_size, n
     h, w = img.shape[:2]
     base_name = img_path.stem
     sr_sub = sr_dir / base_name
-    lr_sub = lr_dir / base_name
     sr_sub.mkdir(exist_ok=True, parents=True)
-    lr_sub.mkdir(exist_ok=True, parents=True)
+    lr_sub_dirs = {f: (output_root / f"lr_x{f}" / base_name) for f in downsample_factors}
+    for d in lr_sub_dirs.values():
+        d.mkdir(exist_ok=True, parents=True)
 
     try:
         tiles = extract_center_grid_tiles(img, n_tiles, tile_size)
@@ -126,6 +132,7 @@ def process_single_image(img_path_str, output_root_str, downsample, tile_size, n
             "status": "geometry_error",
             "filename": img_path.name,
             "tiles": 0,
+            "lr_tiles": 0,
             "mapping": [],
             "per_image": {
                 "filename": img_path.name,
@@ -146,39 +153,58 @@ def process_single_image(img_path_str, output_root_str, downsample, tile_size, n
         "processing_time_seconds": None,
     }
     mapping_rows = []
+
+    multi = len(downsample_factors) > 1
+
     for i, (tile_hr, x, y) in enumerate(tiles):
         tile_hr_pil = Image.fromarray(tile_hr)
         sr_filename = sr_sub / f"{base_name}_tile_{i:04d}_x{x}_y{y}.png"
         tile_hr_pil.save(sr_filename)
-
-        tile_lr = downsample_image(
-            tile_hr,
-            downsample,
-            add_blur=(blur_kernel is not None),
-            blur_kernel=blur_kernel,
-            add_noise=(noise_std is not None),
-            noise_std=noise_std,
-        )
-        tile_lr_pil = Image.fromarray(tile_lr)
-        lr_filename = lr_sub / f"{base_name}_tile_{i:04d}_x{x}_y{y}.png"
-        tile_lr_pil.save(lr_filename)
-
         sr_rel = sr_filename.relative_to(output_root)
-        lr_rel = lr_filename.relative_to(output_root)
-        mapping_rows.append((str(sr_rel), str(lr_rel)))
-        per_image["tiles"].append({
-            "index": i,
-            "hr_path": str(sr_rel),
-            "lr_path": str(lr_rel),
-            "x": x,
-            "y": y,
-        })
+
+        lr_paths = {}
+        for fct in downsample_factors:
+            tile_lr = downsample_image(
+                tile_hr,
+                fct,
+                add_blur=(blur_kernel is not None),
+                blur_kernel=blur_kernel,
+                add_noise=(noise_std is not None),
+                noise_std=noise_std,
+            )
+            lr_filename = lr_sub_dirs[fct] / f"{base_name}_tile_{i:04d}_x{x}_y{y}.png"
+            Image.fromarray(tile_lr).save(lr_filename)
+            lr_rel = lr_filename.relative_to(output_root)
+            lr_paths[f"x{fct}"] = str(lr_rel)
+
+        if multi:
+            row = [str(sr_rel)] + [lr_paths[f"x{f}"] for f in downsample_factors]
+            mapping_rows.append(row)
+            per_image["tiles"].append({
+                "index": i,
+                "hr_path": str(sr_rel),
+                "lr_paths": lr_paths,
+                "x": x,
+                "y": y,
+            })
+        else:
+            # single factor backward compat
+            only_lr = lr_paths[f"x{downsample_factors[0]}"]
+            mapping_rows.append((str(sr_rel), only_lr))
+            per_image["tiles"].append({
+                "index": i,
+                "hr_path": str(sr_rel),
+                "lr_path": only_lr,
+                "x": x,
+                "y": y,
+            })
 
     per_image["processing_time_seconds"] = round(time.time() - start, 3)
     return {
         "status": "ok",
         "filename": img_path.name,
         "tiles": len(tiles),
+        "lr_tiles": len(tiles) * len(downsample_factors),
         "mapping": mapping_rows,
         "per_image": per_image,
         "duration": per_image["processing_time_seconds"],
@@ -186,12 +212,13 @@ def process_single_image(img_path_str, output_root_str, downsample, tile_size, n
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract centered grid tiles from random JP2 images and generate LR counterparts (multiprocess)")
+    parser = argparse.ArgumentParser(description="Extract centered grid tiles from random JP2 images and generate LR counterparts (multiprocess, multi-scale)")
     parser.add_argument("input_dir", type=str, help="Directory containing JP2 images")
     parser.add_argument("--n_images", type=int, default=1, help="Number of JP2 images to randomly sample")
     parser.add_argument("--n_tiles", type=int, default=16, help="Number of tiles per image (perfect square)")
     parser.add_argument("--tile_size", type=int, default=256, help="Square tile size in pixels")
-    parser.add_argument("--downsample", type=int, default=4, help="Downsampling factor for LR tiles")
+    # Allow one or multiple factors (default single 4 for backward compatibility)
+    parser.add_argument("--downsample", type=int, nargs="+", default=[4], help="One or more downsampling factors (e.g. --downsample 4 8)")
     parser.add_argument("--output_dir", type=str, required=True, help="Root output directory")
     parser.add_argument("--blur_kernel", type=int, default=None, help="Gaussian blur kernel size (must be odd)")
     parser.add_argument("--noise_std", type=float, default=None, help="Gaussian noise std dev")
@@ -205,6 +232,16 @@ def main():
     # Seed RNGs
     random.seed(args.seed)
     np.random.seed(args.seed)
+
+    # Normalize & validate downsample factors (preserve order, uniq)
+    factors = []
+    for f in args.downsample:
+        if f not in factors:
+            factors.append(f)
+    for f in factors:
+        if f < 2:
+            raise ValueError(f"Downsample factor must be >=2, got {f}")
+    multi_scale = len(factors) > 1
 
     # Validate blur kernel
     if args.blur_kernel is not None and args.blur_kernel % 2 == 0:
@@ -220,9 +257,9 @@ def main():
         print(f"Removing existing output directory: {output_path}")
         shutil.rmtree(output_path)
     sr_dir = output_path / "sr"
-    lr_dir = output_path / f"lr_x{args.downsample}"
     sr_dir.mkdir(parents=True)
-    lr_dir.mkdir(parents=True)
+    for f in factors:
+        (output_path / f"lr_x{f}").mkdir(parents=True)
 
     print(
         f"Sampling {args.n_images} JP2 image(s) (size >= {args.min_size_bytes} bytes) from {args.input_dir} with seed {args.seed} ..."
@@ -244,24 +281,27 @@ def main():
         "selected_images": len(selected_images),
         "n_tiles_per_image": args.n_tiles,
         "tile_size": args.tile_size,
-        "downsample_factor": args.downsample,
+        "downsample_factors": factors,
+        # keep single-factor key for backward compatibility
+        **({"downsample_factor": factors[0]} if len(factors) == 1 else {}),
         "degradations": {
             "blur_kernel": args.blur_kernel,
             "noise_std": args.noise_std,
         },
         "images": [],
         "total_sr_tiles": 0,
-        "total_lr_tiles": 0,
+        "total_lr_tiles": 0,  # combined across factors
+        "total_lr_tiles_per_factor": {},
         "output_dirs": {
             "sr": str(sr_dir.relative_to(output_path)),
-            "lr": str(lr_dir.relative_to(output_path)),
+            **{f"lr_x{f}": f"lr_x{f}" for f in factors},
         },
         "skipped_corrupted": 0,
         "skipped_geometry_error": 0,
         "script_options": {
             "tile_size": args.tile_size,
             "n_tiles": args.n_tiles,
-            "downsample": args.downsample,
+            "downsample_factors": factors,
             "min_size_bytes": args.min_size_bytes,
             "seed": args.seed,
             "num_workers": args.num_workers or os.cpu_count(),
@@ -270,21 +310,19 @@ def main():
     }
 
     total_expected_tiles = len(selected_images) * args.n_tiles
-
     num_workers = args.num_workers or os.cpu_count() or 1
     print(f"Using {num_workers} worker process(es)...")
 
     worker_fn = partial(
         process_single_image,
         output_root_str=str(output_path),
-        downsample=args.downsample,
+        downsample_factors=factors,
         tile_size=args.tile_size,
         n_tiles=args.n_tiles,
         blur_kernel=args.blur_kernel,
         noise_std=args.noise_std,
     )
 
-    # Global progress bar
     pbar = tqdm(total=total_expected_tiles, desc="Processing tiles", unit="tile")
 
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -294,24 +332,31 @@ def main():
             status = result["status"]
             if status == "ok":
                 metadata["total_sr_tiles"] += result["tiles"]
-                metadata["total_lr_tiles"] += result["tiles"]
+                metadata["total_lr_tiles"] += result["lr_tiles"]
+                # per factor counts (each factor adds same number of tiles)
+                for f in factors:
+                    metadata["total_lr_tiles_per_factor"].setdefault(f"x{f}", 0)
+                    metadata["total_lr_tiles_per_factor"][f"x{f}"] += result["tiles"]
                 metadata["images"].append(result["per_image"])
                 mapping_rows.extend(result["mapping"])
-                pbar.update(result["tiles"])  # add number of tiles processed
+                pbar.update(result["tiles"])
             elif status == "corrupted":
                 metadata["skipped_corrupted"] += 1
-                pbar.update(0)
             elif status == "geometry_error":
                 metadata["skipped_geometry_error"] += 1
-                pbar.update(0)
     pbar.close()
 
     # Write CSV mapping
     csv_path = output_path / "mapping.csv"
     with csv_path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["sr_path", "lr_path"])  # header
-        writer.writerows(mapping_rows)
+        if multi_scale:
+            header = ["sr_path"] + [f"lr_x{f}" for f in factors]
+            writer.writerow(header)
+            writer.writerows(mapping_rows)
+        else:
+            writer.writerow(["sr_path", "lr_path"])  # backward compat
+            writer.writerows(mapping_rows)
 
     end_time = time.time()
     duration = end_time - start_time
@@ -335,9 +380,15 @@ def main():
     print(f"Geometry errors skipped: {metadata['skipped_geometry_error']}")
     print(f"Tiles per successful image (target): {args.n_tiles}")
     print(f"Total SR tiles: {metadata['total_sr_tiles']}")
-    print(f"Total LR tiles: {metadata['total_lr_tiles']}")
-    print(f"Throughput: {metadata['throughput_tiles_per_sec']} tiles/sec")
-    print(f"Downsample factor: {args.downsample}")
+    if multi_scale:
+        print(f"Downsample factors: {factors}")
+        for f in factors:
+            print(f"  LR x{f} tiles: {metadata['total_lr_tiles_per_factor']['x'+str(f)]}")
+        print(f"Total LR tiles (all scales): {metadata['total_lr_tiles']}")
+    else:
+        print(f"Downsample factor: {factors[0]}")
+        print(f"Total LR tiles: {metadata['total_lr_tiles']}")
+    print(f"Throughput (SR tiles/sec): {metadata['throughput_tiles_per_sec']}")
     if degradations:
         print("Degradations: " + ", ".join(degradations))
     else:
@@ -346,10 +397,11 @@ def main():
     print(f"Workers used: {num_workers}")
     print(f"CSV mapping: {csv_path}")
     print(f"Metadata JSON: {json_path}")
-    print("Included in metadata.json: requested_images, selected_images, n_tiles_per_image, tile_size, downsample_factor, degradations, per-image dimensions & tile list, total_sr_tiles, total_lr_tiles, skipped counts, output_dirs, script_options, timing info, throughput")
+    print("Included in metadata.json: multi-scale aware keys (downsample_factors, total_lr_tiles_per_factor) plus legacy compatibility keys when single factor.")
     print(f"Elapsed time: {metadata['time']['duration_seconds']}s")
     print(f"SR directory: {sr_dir}")
-    print(f"LR directory: {lr_dir}")
+    for f in factors:
+        print(f"LR x{f} directory: {output_path / ('lr_x'+str(f))}")
 
 
 if __name__ == "__main__":

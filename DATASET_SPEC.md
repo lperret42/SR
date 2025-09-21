@@ -5,22 +5,30 @@ This document describes the structure and contents of the generated super-resolu
 ## Directory Layout
 ```
 <output_root>/
-  sr/                     # High-resolution (SR) tiles (original resolution)
-    <image_base>/         # One subdirectory per source JP2 (basename without extension)
-      <basename>_tile_XXXX_x<X>_y<Y>.png
-  lr_x<factor>/           # Low-resolution (LR) tiles (downsampled by <factor>)
+  sr/                      # High-resolution (SR) tiles (original resolution)
     <image_base>/
       <basename>_tile_XXXX_x<X>_y<Y>.png
-  mapping.csv             # CSV mapping SR ↔ LR relative paths
-  metadata.json           # Dataset metadata & provenance
+  lr_x<factor>/             # One directory per low-resolution scale factor (>=2)
+    <image_base>/
+      <basename>_tile_XXXX_x<X>_y<Y>.png
+  mapping.csv               # CSV mapping SR ↔ LR(s) (format depends on #factors)
+  metadata.json             # Dataset metadata & provenance
 ```
-
-Example (factor = 4):
+Single-scale (legacy) example (factor = 4):
 ```
 output/
   sr/sceneA/sceneA_tile_0003_x1234_y5678.png
   lr_x4/sceneA/sceneA_tile_0003_x1234_y5678.png
-  mapping.csv
+  mapping.csv               # 2 columns (sr_path, lr_path)
+  metadata.json
+```
+Multi-scale example (factors = 2 and 4):
+```
+output/
+  sr/sceneA/sceneA_tile_0003_x1234_y5678.png
+  lr_x2/sceneA/sceneA_tile_0003_x1234_y5678.png
+  lr_x4/sceneA/sceneA_tile_0003_x1234_y5678.png
+  mapping.csv               # header: sr_path,lr_x2,lr_x4
   metadata.json
 ```
 
@@ -32,11 +40,17 @@ output/
 - `x`, `y`: Upper-left pixel coordinates of the tile in the original high-res image
 
 ## mapping.csv
-Two-column CSV (header included):
+Two possible formats:
+
+1. Single LR factor (backward compatible):
 ```
 sr_path,lr_path
 sr/sceneA/sceneA_tile_0000_x...png,lr_x4/sceneA/sceneA_tile_0000_x...png
-...
+```
+2. Multi-scale (N factors):
+```
+sr_path,lr_x2,lr_x4,... (one column per factor, ascending order)
+sr/sceneA/sceneA_tile_0000_x...png,lr_x2/sceneA/...,lr_x4/sceneA/...
 ```
 All paths are relative to the dataset root.
 
@@ -46,54 +60,79 @@ Top-level keys (may extend):
 - `selected_images`: Actual number of sampled images (size-filtered)
 - `n_tiles_per_image`: Perfect-square tile count per image
 - `tile_size`: Side length (pixels) of SR tiles
-- `downsample_factor`: Integer LR downsampling factor
+- `downsample_factor`: (legacy) Single factor when only one is used
+- `downsample_factors`: List of factors (present when multi-scale; also present for single for newer versions)
 - `degradations`: { `blur_kernel`, `noise_std` }
 - `images`: List of per-image objects:
   - `filename`, `width`, `height`, `n_tiles`, `tiles` (list)
-  - Each tile: { `index`, `hr_path`, `lr_path`, `x`, `y` }
-- `total_sr_tiles`, `total_lr_tiles`
+  - Each tile (single-scale): { `index`, `hr_path`, `lr_path`, `x`, `y` }
+  - Each tile (multi-scale): { `index`, `hr_path`, `lr_paths`, `x`, `y` } where `lr_paths` is a dict: `{ "x2": <path>, "x4": <path>, ... }`
+- `total_sr_tiles`, `total_lr_tiles`: (total LR tiles across all factors)
+- `total_lr_tiles_per_factor`: Dict factor-key (`"x2"`, `"x4"`, ...) → count
 - `skipped_corrupted`, `skipped_geometry_error`
-- `output_dirs`: Relative SR & LR directory names
-- `script_options`: Execution parameters (including seed, workers, min_size_bytes)
+- `output_dirs`: Includes `sr` plus each `lr_x<factor>` directory
+- `script_options`: Execution parameters (including `downsample_factors`, seed, workers, min_size_bytes)
 - `time`: { `start`, `end`, `duration_seconds` }
-- `throughput_tiles_per_sec`: Aggregate processing speed
+- `throughput_tiles_per_sec`: SR tiles per second (not multiplied by factors)
 
-### Example Snippet
+### Example Snippets
+Single-scale:
 ```json
 {
-  "requested_images": 50,
-  "selected_images": 50,
-  "n_tiles_per_image": 100,
-  "tile_size": 256,
   "downsample_factor": 4,
-  "degradations": { "blur_kernel": 5, "noise_std": 2.0 },
+  "downsample_factors": [4],
   "total_sr_tiles": 5000,
-  "time": { "duration_seconds": 412.387 }
+  "total_lr_tiles": 5000,
+  "total_lr_tiles_per_factor": {"x4": 5000}
+}
+```
+Multi-scale (2 & 4):
+```json
+{
+  "downsample_factors": [2, 4],
+  "total_sr_tiles": 5000,
+  "total_lr_tiles": 10000,
+  "total_lr_tiles_per_factor": {"x2": 5000, "x4": 5000},
+  "images": [
+    {
+      "filename": "sceneA.jp2",
+      "tiles": [
+        {
+          "index": 0,
+          "hr_path": "sr/sceneA/...png",
+          "lr_paths": {"x2": "lr_x2/sceneA/...png", "x4": "lr_x4/sceneA/...png"}
+        }
+      ]
+    }
+  ]
 }
 ```
 
 ## Assumptions
 - All SR tiles share uniform size = `tile_size`.
-- LR tiles are produced via integer-factor downsampling + optional Gaussian blur/noise.
-- Tile grid per source image is centered and non-overlapping.
+- Each LR factor directory contains tiles perfectly aligned (same naming) with SR.
+- LR tile spatial size = `tile_size / factor` (integer division guaranteed by generation step).
+- Multi-scale: all requested factors are generated for each successful image; if not, that image's tiles are skipped (strict mode in generator).
 
 ## Recommended Usage (Training Pipelines)
-1. Parse `metadata.json` for dataset-wide parameters (e.g., `downsample_factor`, `tile_size`).
-2. Stream pairs by reading `mapping.csv` and joining with root path.
-3. For on-the-fly augmentations, operate on SR tiles only; recompute LR if different degradations are needed.
-4. Validate shape consistency: SR tile = `(tile_size, tile_size)`, LR tile = `(tile_size / downsample_factor, tile_size / downsample_factor)`.
+1. Read `metadata.json` to get `downsample_factors` (fallback to `[downsample_factor]` if older single-scale dataset).
+2. Parse `mapping.csv`; if header has more than 2 columns, treat columns 2..N as parallel LR scales.
+3. When training multi-scale SR models, choose a factor per batch or create separate dataloaders keyed by factor.
+4. Validate expected LR size: `SR.shape == (tile_size, tile_size)` and `LR_f.shape == (tile_size / f, tile_size / f)` for each factor `f`.
 
 ## Integrity Checks
-- Ensure counts: `total_sr_tiles == len(mapping.csv lines - 1)`.
-- Cross-check random spot pairs for coordinate consistency (`x`, `y` fields).
+- Single-scale: `total_lr_tiles == total_sr_tiles`.
+- Multi-scale: `total_lr_tiles == total_sr_tiles * len(downsample_factors)` and per-factor counts equal `total_sr_tiles`.
+- `len(mapping.csv lines) - 1 == total_sr_tiles` (SR entries). LR columns must be non-empty.
 
 ## Extensibility Ideas
 - Add SHA256 checksums per tile.
 - Add train/val/test split file lists.
 - Add quality metrics (e.g. per-tile variance) for curriculum sampling.
+- Add optional per-factor degradations metadata if different degradations are applied per scale in future.
 
 ## License & Provenance
 Provenance (source filenames) is preserved via `basename`. Any external licensing considerations must be handled upstream of this dataset generation.
 
 ---
-This specification is minimal yet sufficient for integrating into a super-resolution training pipeline.
+This specification supports both legacy single-scale and new multi-scale super-resolution datasets.
