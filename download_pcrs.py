@@ -75,101 +75,105 @@ def get_dalle_payload(tile_name):
     return {"dalle[]": dalle_name}
 
 
-def download_tile(tile_name, output_dir, session):
+def download_tile(tile_name, output_dir, session, retries=5, retry_wait=5.0, retry_backoff=1.5):
     """
-    Télécharge une tuile dans le répertoire de sortie.
-    
+    Télécharge une tuile dans le répertoire de sortie avec gestion de retries.
+
+    Args:
+        tile_name: nom de la tuile
+        output_dir: dossier de sortie
+        session: session requests
+        retries: nombre total de tentatives
+        retry_wait: attente initiale entre tentatives (s)
+        retry_backoff: facteur multiplicatif pour backoff exponentiel
+
     Returns:
-        tuple: (success: bool, file_size: int, error_msg: str)
+        tuple: (success: bool, file_size: int, status: str)
     """
     url = construct_download_url(tile_name)
     payload = get_dalle_payload(tile_name)
-    
-    # Vérifier si déjà extrait (chercher les .jp2)
+
+    # Vérifier si déjà extrait (chercher les .jp2 / .tif / .jp2.zip déjà extraits)
     existing_files = list(output_dir.glob(f"{tile_name}.*"))
     if existing_files:
         total_size = sum(f.stat().st_size for f in existing_files)
         return True, total_size, "Déjà téléchargé"
-    
-    print(f"🔗 URL: {url}")
-    print(f"📦 Payload: {payload}")
-    
-    # POST request avec la payload
-    response = session.post(url, data=payload, stream=True)
-    response.raise_for_status()
-    
-    # Vérification du content-type
-    content_type = response.headers.get('content-type', '')
-    print(f"📄 Content-Type: {content_type}")
-    
-    file_size = 0
-    content = b""
-    for chunk in response.iter_content(chunk_size=8192):
-        content += chunk
-        file_size += len(chunk)
-    
-    # Détection ZIP
-    is_zip = content.startswith(b'PK\x03\x04') or content_type == 'application/zip'
-    
-    if is_zip:
-        print(f"📦 ZIP détecté - extraction en cours...")
-        
-        # Créer un fichier temporaire pour le ZIP
-        with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as temp_zip:
-            temp_zip.write(content)
-            temp_zip_path = temp_zip.name
-        
+
+    attempt = 0
+    while attempt < retries:
+        attempt += 1
         try:
-            # Extraction du ZIP
-            with zipfile.ZipFile(temp_zip_path, 'r') as zip_ref:
-                # Lister le contenu
-                file_list = zip_ref.namelist()
-                print(f"📋 Contenu du ZIP: {file_list}")
-                
-                extracted_size = 0
-                for file_info in zip_ref.infolist():
-                    # Extraire avec le nom de la tuile comme préfixe
-                    file_ext = Path(file_info.filename).suffix
-                    output_filename = f"{tile_name}{file_ext}"
-                    output_path = output_dir / output_filename
-                    
-                    # Extraction
-                    with zip_ref.open(file_info) as source, open(output_path, 'wb') as target:
-                        target.write(source.read())
-                    
-                    extracted_size += output_path.stat().st_size
-                    print(f"✅ Extrait: {output_filename}")
-                
-                return True, extracted_size, "Téléchargé et extrait"
-        
-        finally:
-            # Nettoyage du fichier temporaire
-            os.unlink(temp_zip_path)
-    
-    else:
-        # Pas un ZIP, traitement comme avant
-        is_jp2 = content.startswith(b'\x00\x00\x00\x0cjP  ') or content.startswith(b'\xff\x4f\xff\x51')
-        is_tif = content.startswith(b'II*\x00') or content.startswith(b'MM\x00*')
-        
-        if is_jp2:
-            final_path = output_dir / f"{tile_name}.jp2"
-            format_detected = "JPEG 2000"
-        elif is_tif:
-            final_path = output_dir / f"{tile_name}.tif"
-            format_detected = "TIFF"
-        else:
-            final_path = output_dir / f"{tile_name}.bin"
-            format_detected = "Format inconnu"
-            print(f"⚠️  Format non reconnu - début: {content[:20].hex()}")
-        
-        print(f"🔍 Format détecté: {format_detected}")
-        print(f"💾 Sauvegarde: {final_path.name}")
-        
-        # Écriture du fichier
-        with open(final_path, 'wb') as f:
-            f.write(content)
-        
-        return True, file_size, "Téléchargé"
+            print(f"🔗 URL: {url} (tentative {attempt}/{retries})")
+            print(f"📦 Payload: {payload}")
+            response = session.post(url, data=payload, stream=True, timeout=60)
+            status_code = response.status_code
+            # Retenter sur 5xx ou 429
+            if status_code >= 500 or status_code in (429,):
+                raise requests.HTTPError(f"Statut {status_code}")
+            # Autres erreurs HTTP
+            if status_code >= 400:
+                raise requests.HTTPError(f"Statut {status_code}")
+
+            content_type = response.headers.get('content-type', '')
+            print(f"📄 Content-Type: {content_type}")
+
+            file_size = 0
+            content = b""
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    content += chunk
+                    file_size += len(chunk)
+
+            is_zip = content.startswith(b'PK\x03\x04') or content_type == 'application/zip'
+            if is_zip:
+                print(f"📦 ZIP détecté - extraction en cours...")
+                with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as temp_zip:
+                    temp_zip.write(content)
+                    temp_zip_path = temp_zip.name
+                try:
+                    with zipfile.ZipFile(temp_zip_path, 'r') as zip_ref:
+                        file_list = zip_ref.namelist()
+                        print(f"📋 Contenu du ZIP: {file_list}")
+                        extracted_size = 0
+                        for file_info in zip_ref.infolist():
+                            file_ext = Path(file_info.filename).suffix
+                            output_filename = f"{tile_name}{file_ext}"
+                            output_path = output_dir / output_filename
+                            with zip_ref.open(file_info) as source, open(output_path, 'wb') as target:
+                                target.write(source.read())
+                            extracted_size += output_path.stat().st_size
+                            print(f"✅ Extrait: {output_filename}")
+                        return True, extracted_size, "Téléchargé et extrait"
+                finally:
+                    os.unlink(temp_zip_path)
+            else:
+                is_jp2 = content.startswith(b'\x00\x00\x00\x0cjP  ') or content.startswith(b'\xff\x4f\xff\x51')
+                is_tif = content.startswith(b'II*\x00') or content.startswith(b'MM\x00*')
+                if is_jp2:
+                    final_path = output_dir / f"{tile_name}.jp2"
+                    format_detected = "JPEG 2000"
+                elif is_tif:
+                    final_path = output_dir / f"{tile_name}.tif"
+                    format_detected = "TIFF"
+                else:
+                    final_path = output_dir / f"{tile_name}.bin"
+                    format_detected = "Format inconnu"
+                    print(f"⚠️  Format non reconnu - début: {content[:20].hex()}")
+                print(f"🔍 Format détecté: {format_detected}")
+                print(f"💾 Sauvegarde: {final_path.name}")
+                with open(final_path, 'wb') as f:
+                    f.write(content)
+                return True, file_size, "Téléchargé"
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError, zipfile.BadZipFile) as e:
+            if attempt >= retries:
+                return False, 0, f"Échec après {retries} tentatives: {e}"
+            wait_time = retry_wait * (retry_backoff ** (attempt - 1))
+            print(f"⚠️  Erreur tentative {attempt}/{retries} pour {tile_name}: {e} -> attente {wait_time:.1f}s avant retry")
+            time.sleep(wait_time)
+        except Exception as e:
+            # Erreur non prévue, ne pas boucler indéfiniment
+            return False, 0, f"Erreur non gérée: {e}"
+    return False, 0, "Échec inconnu"
 
 
 def format_bytes(bytes_size):
@@ -216,6 +220,18 @@ Exemples d'utilisation:
         type=int,
         default=4,
         help='Nombre maximum de téléchargements simultanés (défaut: 4)'
+    )
+    parser.add_argument(
+        '--retries', type=int, default=5,
+        help='Nombre de tentatives par tuile avant abandon (défaut: 5)'
+    )
+    parser.add_argument(
+        '--retry-wait', type=float, default=5.0,
+        help="Attente initiale (sec) avant la première relance (défaut: 5.0)"
+    )
+    parser.add_argument(
+        '--retry-backoff', type=float, default=1.5,
+        help="Facteur multiplicatif de backoff exponentiel (défaut: 1.5)"
     )
     
     args = parser.parse_args()
@@ -272,20 +288,21 @@ Exemples d'utilisation:
     with tqdm(tiles, desc="Téléchargement", unit="tuile") as pbar:
         for tile_name in pbar:
             pbar.set_postfix_str(f"Actuel: {tile_name[:20]}...")
-            
-            success, file_size, status = download_tile(tile_name, args.output_dir, session)
-            
+            success, file_size, status = download_tile(
+                tile_name, args.output_dir, session,
+                retries=args.retries,
+                retry_wait=args.retry_wait,
+                retry_backoff=args.retry_backoff
+            )
             if success:
                 total_size += file_size
-                if status == "Téléchargé":
+                if status.startswith("Téléchargé"):
                     total_downloaded += 1
-                else:  # "Déjà téléchargé"
+                elif status == "Déjà téléchargé":
                     total_skipped += 1
             else:
                 total_errors += 1
                 print(f"❌ Erreur pour {tile_name}: {status}")
-            
-            # Mise à jour des stats dans la barre
             pbar.set_postfix_str(
                 f"✅ {total_downloaded} | ⏭️  {total_skipped} | ❌ {total_errors}"
             )
