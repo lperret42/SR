@@ -17,6 +17,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
+from collections import OrderedDict
 
 import numpy as np
 import torch
@@ -30,7 +31,7 @@ import torchvision.transforms.functional as TF
 from torchvision.utils import save_image
 from tqdm import tqdm
 
-from models.network_swinir import SwinIR
+from models.network_swinir import SwinIR, get_realsr_config
 from utils.util_calculate_psnr_ssim import calculate_psnr, calculate_ssim
 
 
@@ -246,6 +247,17 @@ class CharbonnierLoss(nn.Module):
     def forward(self, x, y): return torch.mean(torch.sqrt((x - y) ** 2 + self.eps))
 
 
+def gradient_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Simple L1 gradient consistency loss using forward differences."""
+    dx_pred = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+    dx_target = target[:, :, :, 1:] - target[:, :, :, :-1]
+    dy_pred = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+    dy_target = target[:, :, 1:, :] - target[:, :, :-1, :]
+    loss_x = torch.mean(torch.abs(dx_pred - dx_target))
+    loss_y = torch.mean(torch.abs(dy_pred - dy_target))
+    return loss_x + loss_y
+
+
 @torch.no_grad()
 def compute_batch_metrics(pred: torch.Tensor, target: torch.Tensor) -> Dict[str, float]:
     pred = pred.float(); target = target.float()
@@ -263,36 +275,131 @@ def compute_batch_metrics(pred: torch.Tensor, target: torch.Tensor) -> Dict[str,
             "l2": F.mse_loss(pred, target).item()}
 
 
+def _torch_load_compat(path, map_location="cpu"):
+    """Load checkpoints compatible with PyTorch>=2.6 (weights_only default True).
+    Always uses weights_only=False for trusted local files, falling back if arg unsupported.
+    """
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        # Older PyTorch without weights_only kwarg
+        return torch.load(path, map_location=map_location)
+
+
+def _is_state_dict_like(obj) -> bool:
+    return isinstance(obj, (dict, OrderedDict)) and len(obj) > 0 and all(isinstance(v, torch.Tensor) for v in obj.values())
+
+
+def _strip_prefix(sd: Dict[str, torch.Tensor], prefix: str) -> Dict[str, torch.Tensor]:
+    if not prefix:
+        return sd
+    plen = len(prefix)
+    if not all(k.startswith(prefix) for k in sd.keys()):
+        return sd
+    return {k[plen:]: v for k, v in sd.items()}
+
+
+def _try_load(model: nn.Module, sd: Dict[str, torch.Tensor], strict_first: bool = True) -> tuple[bool, str]:
+    # Try several common prefixes
+    prefixes = [
+        "", "module.", "model.", "net.", "network.", "generator.", "swinir.",
+        "module.model.", "ema.", "params.", "student.",
+    ]
+    last_err = ""
+    for pfx in prefixes:
+        sd_p = _strip_prefix(sd, pfx)
+        try:
+            model.load_state_dict(sd_p, strict=True if strict_first else False)
+            return True, f"loaded (strict={strict_first}, prefix='{pfx}')"
+        except Exception as e:
+            last_err = str(e)
+    if strict_first:
+        # Try non-strict as fallback to allow partial load
+        for pfx in prefixes:
+            sd_p = _strip_prefix(sd, pfx)
+            try:
+                missing, unexpected = model.load_state_dict(sd_p, strict=False)
+                msg = (f"loaded (strict=False, prefix='{pfx}', missing={len(missing)}, unexpected={len(unexpected)})")
+                if missing or unexpected:
+                    msg += f"\n  missing: {list(missing)[:8]} ...\n  unexpected: {list(unexpected)[:8]} ..."
+                return True, msg
+            except Exception as e:
+                last_err = str(e)
+    return False, last_err
+
+
+def load_weights_robust(model: nn.Module, ckpt_obj) -> None:
+    """Robustly locate and load a state_dict from a checkpoint object into model.
+    - Supports top-level state_dict or under common keys (model/state_dict/params_ema/...)
+    - Tries common key prefixes (module., model., net., ...)
+    - Falls back to non-strict load with summary, otherwise raises.
+    """
+    candidates: List[Dict[str, torch.Tensor]] = []
+
+    def add_candidate(obj):
+        if _is_state_dict_like(obj):
+            candidates.append(obj)  # type: ignore[arg-type]
+
+    if _is_state_dict_like(ckpt_obj):
+        add_candidate(ckpt_obj)
+
+    if isinstance(ckpt_obj, (dict, OrderedDict)):
+        keys_to_try = [
+            "model", "state_dict", "params_ema", "params", "net", "network",
+            "generator", "ema", "module", "weights", "state",
+        ]
+        for k in keys_to_try:
+            if k in ckpt_obj and isinstance(ckpt_obj[k], (dict, OrderedDict)):
+                add_candidate(ckpt_obj[k])
+        # Nested common pattern: {"state_dict": {"model": sd}}
+        sd = ckpt_obj.get("state_dict")
+        if isinstance(sd, (dict, OrderedDict)):
+            for k in keys_to_try:
+                if k in sd and isinstance(sd[k], (dict, OrderedDict)):
+                    add_candidate(sd[k])
+
+    tried_msgs = []
+    last_err = ""
+    for sd in candidates:
+        ok, msg = _try_load(model, sd, strict_first=True)
+        tried_msgs.append(msg if ok else f"fail: {msg}")
+        if ok:
+            print("✓ Init weights", msg)
+            return
+        last_err = msg
+
+    raise RuntimeError(
+        "Failed to load any state_dict from checkpoint.\n"
+        f"Tried candidates: {len(candidates)}\nLast error: {last_err}"
+    )
+
+
 # ------
 # Model
 # ------
 
 def create_model(model_size: str, pretrained: bool, device: str) -> SwinIR:
-    if model_size == "M":
-        model = SwinIR(
-            upscale=4, in_chans=3, img_size=64, window_size=8, img_range=1.0,
-            depths=[6]*6, embed_dim=180, num_heads=[6]*6, mlp_ratio=2,
-            upsampler="nearest+conv", resi_connection="1conv"
-        )
-        url = "https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth"
-    elif model_size == "L":
-        model = SwinIR(
-            upscale=4, in_chans=3, img_size=64, window_size=8, img_range=1.0,
-            depths=[6]*9, embed_dim=240, num_heads=[8]*9, mlp_ratio=2,
-            upsampler="nearest+conv", resi_connection="3conv"
-        )
-        url = "https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth"
-    else:
-        raise ValueError("model-size must be M or L")
+    cfg = get_realsr_config(model_size)
+    pretrained_path_value = cfg.pop("pretrained_path", None)
+    pretrained_path = Path(pretrained_path_value) if pretrained_path_value else None
+    pretrained_url = cfg.pop("pretrained_url", None)
+
+    model = SwinIR(**cfg)
 
     if pretrained:
-        weights = Path(f"pretrained_swinir_{model_size}_real_sr_x4.pth")
+        if not pretrained_path:
+            raise ValueError(f"No pretrained weights available for SwinIR-{model_size}.")
+        weights = pretrained_path
         if not weights.exists():
+            if not pretrained_url:
+                raise FileNotFoundError(
+                    f"Pretrained weights for SwinIR-{model_size} not found locally and no download URL provided."
+                )
             print(f"Téléchargement SwinIR-{model_size} pré-entraîné ...")
             import urllib.request
-            urllib.request.urlretrieve(url, weights)
+            urllib.request.urlretrieve(pretrained_url, weights)
             print(f"Saved to: {weights}")
-        ckpt = torch.load(weights, map_location="cpu")
+        ckpt = _torch_load_compat(weights, map_location="cpu")
         if isinstance(ckpt, dict) and "params_ema" in ckpt:
             model.load_state_dict(ckpt["params_ema"], strict=True)
         else:
@@ -382,9 +489,12 @@ def save_visual_samples(model, loader, out_dir: Path, device, n_samples=100, amp
         lr = lr.to(device); hr = hr.to(device)
         sr = forward_sr(model, lr, amp_dtype, amp)
         lr_bi = torch.clamp(F.interpolate(lr, scale_factor=4, mode="bicubic", align_corners=False), 0, 1)
+        # Small white separator band to better distinguish the panels
+        gap_width = 8
         for i in range(lr.shape[0]):
             if saved >= n_samples: return
-            grid = torch.cat([lr_bi[i].float(), sr[i].float(), hr[i].float()], dim=2)
+            gap = torch.ones((3, sr[i].shape[1], gap_width), device=sr.device, dtype=sr.dtype).float()
+            grid = torch.cat([lr_bi[i].float(), gap, sr[i].float(), gap, hr[i].float()], dim=2)
             fn = names[i].replace(".png", "_comparison.png")
             save_image(grid, out_dir / fn)
             saved += 1
@@ -399,8 +509,11 @@ def main():
 
     # Required
     parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument("--model-size", choices=["M", "L"], default="M")
+    parser.add_argument("--model-size", choices=["M", "L", "XL", "XXL"], default="M")
     parser.add_argument("--pretrained", action="store_true")
+    # NEW: init from checkpoint
+    parser.add_argument("--init-from", type=str, default=None,
+                        help="Path to a .pth checkpoint to initialize model weights (overrides --pretrained if both are set)")
 
     # Train setup
     parser.add_argument("--epochs", type=int, default=100)
@@ -409,7 +522,7 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--compile", action="store_true", default=False)
 
@@ -452,6 +565,19 @@ def main():
 
     args = parser.parse_args()
 
+    XXL_LOSS_NAME = "xxl_charb+perc+grad"
+    xxl_defaults = args.model_size == "XXL"
+    effective_loss_type = XXL_LOSS_NAME if xxl_defaults else args.loss_type
+    loss_override_details: Dict[str, float | str] = {}
+    if xxl_defaults:
+        loss_override_details = {
+            "requested_loss_type": args.loss_type,
+            "requested_perceptual_weight": args.perceptual_weight,
+            "charbonnier_weight": 1.0,
+            "perceptual_weight_used": 0.2,
+            "gradient_weight_used": 0.05,
+        }
+
     if args.bf16 and args.fp16:
         raise ValueError("Choisir soit --bf16 soit --fp16, pas les deux.")
 
@@ -460,15 +586,20 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
+    loss_token_for_dir = effective_loss_type
     out_dir = Path(args.output_dir) if args.output_dir else Path("runs") / (
         ("pretrained_" if args.pretrained else "") +
-        f"swinir_{args.model_size}_lr{args.lr}_bs{args.batch_size}_{args.loss_type}_" +
+        f"swinir_{args.model_size}_lr{args.lr}_bs{args.batch_size}_{loss_token_for_dir}_" +
         ("bf16" if args.bf16 else ("fp16" if args.fp16 else "fp32")) + "_" +
         datetime.now().strftime("%Y%m%d_%H%M%S")
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     args_json = vars(args).copy()
     args_json["output_dir"] = str(out_dir)
+    args_json["loss_type_effective"] = effective_loss_type
+    args_json["xxl_defaults_active"] = xxl_defaults
+    if loss_override_details:
+        args_json["xxl_loss_overrides"] = loss_override_details
     with open(out_dir / "args.json", "w") as f:
         json.dump(args_json, f, indent=2)
 
@@ -506,26 +637,54 @@ def main():
                         persistent_workers=args.num_workers > 0)
 
     model = create_model(args.model_size, args.pretrained, args.device)
+
+    if xxl_defaults:
+        print("XXL defaults engaged:")
+        print(f" - Reconstruction head forced to 'nearest+conv' with widened feature width ({getattr(model, 'num_feat', 'unknown')} channels).")
+        print(" - Composite loss: Charbonnier + 0.2·Perceptual + 0.05·Gradient (ignoring --loss-type/--perceptual-weight).")
+        if loss_override_details:
+            print(f"   Requested loss '{loss_override_details['requested_loss_type']}' ignored.")
+            print(f"   Requested perceptual weight {loss_override_details['requested_perceptual_weight']} ignored.")
+
+    # If provided, initialize weights from a specific checkpoint path (robust loader)
+    if args.init_from is not None:
+        ckpt_path = Path(args.init_from)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        print(f"Loading init weights from: {ckpt_path}")
+        ckpt = _torch_load_compat(ckpt_path, map_location="cpu")
+        load_weights_robust(model, ckpt)
+        if args.pretrained:
+            print("Note: --init-from overrides weights loaded via --pretrained.")
+
     if args.compile and hasattr(torch, "compile"):
         model = torch.compile(model, mode="max-autotune")
         print("✓ torch.compile enabled")
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
-    if args.loss_type == "l1":
+    if effective_loss_type == "l1":
         criterion = nn.L1Loss()
-    elif args.loss_type == "l2":
+    elif effective_loss_type == "l2":
         criterion = nn.MSELoss()
-    elif args.loss_type == "charbonnier":
+    elif effective_loss_type == "charbonnier":
         criterion = CharbonnierLoss()
-    elif args.loss_type in ("l1+perceptual", "charbonnier+perceptual"):
-        base = nn.L1Loss() if args.loss_type.startswith("l1") else CharbonnierLoss()
+    elif effective_loss_type in ("l1+perceptual", "charbonnier+perceptual"):
+        base = nn.L1Loss() if effective_loss_type.startswith("l1") else CharbonnierLoss()
         perceptual = PerceptualLoss().to(args.device)
         def combined(pred, tgt): return base(pred, tgt) + args.perceptual_weight * perceptual(pred, tgt)
         criterion = combined
+    elif effective_loss_type == XXL_LOSS_NAME:
+        base = CharbonnierLoss()
+        perceptual = PerceptualLoss().to(args.device)
+        perc_w = loss_override_details.get("perceptual_weight_used", 0.2) if loss_override_details else 0.2
+        grad_w = loss_override_details.get("gradient_weight_used", 0.05) if loss_override_details else 0.05
+        def combined(pred, tgt):
+            return base(pred, tgt) + perc_w * perceptual(pred, tgt) + grad_w * gradient_loss(pred, tgt)
+        criterion = combined
     else:
         raise ValueError("Unknown loss type")
-    print(f"Loss: {args.loss_type}")
+    print(f"Loss: {effective_loss_type}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=args.weight_decay)
     if args.scheduler == "cosine":
